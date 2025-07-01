@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/uploads:/app/uploads
+      - ./backend/processing:/app/processing
+      - /var/run/docker.sock:/var/run/docker.sock  # Allow Docker-in-Docker
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - redis
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  worker:
+    build: ./backend
+    volumes:
+      - ./backend/uploads:/app/uploads
+      - ./backend/processing:/app/processing
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - redis
+    command: celery -A tasks worker --loglevel=info
+
+  # Pull COLMAP image but don't run it - it will be used by the worker
+  colmap:
+    image: colmap/colmap:latest
+    command: echo "COLMAP image ready"
+    profiles:
+      - setup
+
+volumes:
+  redis_data: 

@@ -1,0 +1,10 @@
+fastapi==0.115.7
+uvicorn[standard]==0.34.0
+python-multipart==0.0.9
+python-json-logger==2.0.7
+numpy==1.24.3
+scipy==1.11.4
+Pillow==10.1.0
+aiofiles==23.2.1
+celery==5.3.4
+redis==5.0.1 
