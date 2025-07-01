@@ -245,7 +245,7 @@ CMD ["npm", "run", "preview"]
 
 ## 📄 License
 
-This project is licensed under the MIT License.
+This project is licensed under the AGPL-3 License.
 
 ## 🔗 References
 
