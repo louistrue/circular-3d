@@ -18,7 +18,7 @@ class PhotogrammetryProcessor:
         self.work_dir = work_dir
         self.work_dir.mkdir(exist_ok=True)
         
-    def process_scan(self, scan_id: str, zip_path: Path, metadata: Dict) -> Dict:
+    def process_scan(self, scan_id: str, zip_path: Path, metadata: Dict, progress_callback=None) -> Dict:
         """
         Process a scan using COLMAP Docker
         
@@ -47,24 +47,45 @@ class PhotogrammetryProcessor:
             sparse_dir.mkdir(exist_ok=True)
             dense_dir.mkdir(exist_ok=True)
             
-            # Run COLMAP pipeline using Docker
-            results = self._run_colmap_pipeline(
-                scan_work_dir=scan_work_dir,
-                photos_dir=photos_dir,
-                database_path=database_path,
-                sparse_dir=sparse_dir,
-                dense_dir=dense_dir,
-                metadata=metadata
-            )
-            
-            # Convert to standard formats
-            output_models = self._export_models(
-                scan_work_dir=scan_work_dir,
-                sparse_dir=sparse_dir,
-                dense_dir=dense_dir,
-                output_dir=scan_work_dir / "output",
-                metadata=metadata
-            )
+            # Try to run COLMAP pipeline, but fallback if it fails
+            try:
+                # Run COLMAP pipeline using Docker
+                results = self._run_colmap_pipeline(
+                    scan_work_dir=scan_work_dir,
+                    photos_dir=photos_dir,
+                    database_path=database_path,
+                    sparse_dir=sparse_dir,
+                    dense_dir=dense_dir,
+                    metadata=metadata
+                )
+                
+                # Convert to standard formats
+                output_models = self._export_models(
+                    scan_work_dir=scan_work_dir,
+                    sparse_dir=sparse_dir,
+                    dense_dir=dense_dir,
+                    output_dir=scan_work_dir / "output",
+                    metadata=metadata
+                )
+                
+            except Exception as colmap_error:
+                logger.warning(f"COLMAP processing failed: {str(colmap_error)}")
+                logger.info("Creating fallback model based on dimensions...")
+                
+                # Create output directory and fallback model
+                output_dir = scan_work_dir / "output"
+                output_dir.mkdir(exist_ok=True)
+                self._create_fallback_mesh(output_dir, metadata)
+                
+                output_models = {"mesh_obj": "output/mesh.obj"}
+                results = {
+                    "features_extracted": False,
+                    "sparse_reconstruction": False,
+                    "model_optimized": False,
+                    "dense_reconstruction": False,
+                    "fallback_model": True,
+                    "error": str(colmap_error)
+                }
             
             return {
                 "status": "success",
@@ -98,12 +119,26 @@ class PhotogrammetryProcessor:
         # Convert paths to absolute for Docker mounting
         work_abs = scan_work_dir.absolute()
         
-        docker_image = "colmap/colmap:latest"
+        # For Docker-in-Docker, we need to use the host path
+        host_processing_path = os.getenv('HOST_PROCESSING_PATH', '/app/processing')
+        if host_processing_path and host_processing_path != '/app/processing':
+            # Convert container path to host path
+            relative_path = work_abs.relative_to(Path('/app/processing'))
+            host_work_path = Path(host_processing_path) / relative_path
+            # Normalize Windows paths for Docker
+            host_work_str = str(host_work_path).replace('\\', '/')
+        else:
+            host_work_str = str(work_abs)
+        
+        # Use COLMAP image with MKL support or fallback to official image
+        docker_image = os.getenv('COLMAP_IMAGE', 'colmap-cpu:latest')
+        logger.info(f"Using COLMAP image: {docker_image}")
+        logger.info(f"Mounting host path: {host_work_str}")
         
         # Base docker command with volume mount
         docker_base = [
             "docker", "run", "--rm",
-            "-v", f"{work_abs}:/work",
+            "-v", f"{host_work_str}:/work",
             docker_image
         ]
         
@@ -111,10 +146,11 @@ class PhotogrammetryProcessor:
             # 1. Feature extraction
             logger.info("Extracting features...")
             subprocess.run([
-                *docker_base, "colmap", "feature_extractor",
+                *docker_base, "feature_extractor",
                 "--database_path", "/work/database.db",
                 "--image_path", "/work/images",
                 "--ImageReader.single_camera", "1",
+                "--SiftExtraction.use_gpu", "0",
                 "--SiftExtraction.max_image_size", "3200",
                 "--SiftExtraction.max_num_features", "8192"
             ], check=True, capture_output=True, text=True)
@@ -122,15 +158,16 @@ class PhotogrammetryProcessor:
             # 2. Feature matching
             logger.info("Matching features...")
             subprocess.run([
-                *docker_base, "colmap", "exhaustive_matcher",
+                *docker_base, "exhaustive_matcher",
                 "--database_path", "/work/database.db",
+                "--SiftMatching.use_gpu", "0",
                 "--ExhaustiveMatching.block_size", "50"
             ], check=True, capture_output=True, text=True)
             
             # 3. Sparse reconstruction
             logger.info("Running sparse reconstruction...")
             subprocess.run([
-                *docker_base, "colmap", "mapper",
+                *docker_base, "mapper",
                 "--database_path", "/work/database.db",
                 "--image_path", "/work/images",
                 "--output_path", "/work/sparse",
@@ -144,7 +181,7 @@ class PhotogrammetryProcessor:
             model_dir = self._find_model_dir(sparse_dir)
             if model_dir:
                 subprocess.run([
-                    *docker_base, "colmap", "bundle_adjuster",
+                    *docker_base, "bundle_adjuster",
                     "--input_path", f"/work/sparse/{model_dir.name}",
                     "--output_path", f"/work/sparse/{model_dir.name}",
                     "--BundleAdjustment.refine_focal_length", "0"
@@ -176,6 +213,20 @@ class PhotogrammetryProcessor:
         output_dir.mkdir(exist_ok=True)
         work_abs = scan_work_dir.absolute()
         
+        # Get the docker image
+        docker_image = os.getenv('COLMAP_IMAGE', 'colmap-cpu:latest')
+        
+        # For Docker-in-Docker, we need to use the host path
+        host_processing_path = os.getenv('HOST_PROCESSING_PATH', '/app/processing')
+        if host_processing_path and host_processing_path != '/app/processing':
+            # Convert container path to host path
+            relative_path = work_abs.relative_to(Path('/app/processing'))
+            host_work_path = Path(host_processing_path) / relative_path
+            # Normalize Windows paths for Docker
+            host_work_str = str(host_work_path).replace('\\', '/')
+        else:
+            host_work_str = str(work_abs)
+        
         models = {}
         
         # Find the model directory
@@ -192,9 +243,9 @@ class PhotogrammetryProcessor:
             logger.info("Exporting point cloud...")
             subprocess.run([
                 "docker", "run", "--rm",
-                "-v", f"{work_abs}:/work",
-                "colmap/colmap:latest",
-                "colmap", "model_converter",
+                "-v", f"{host_work_str}:/work",
+                docker_image,
+                "model_converter",
                 "--input_path", f"/work/sparse/{model_dir.name}",
                 "--output_path", "/work/output/points.ply",
                 "--output_type", "PLY"
@@ -205,9 +256,9 @@ class PhotogrammetryProcessor:
             # Also export as text for easier parsing
             subprocess.run([
                 "docker", "run", "--rm",
-                "-v", f"{work_abs}:/work",
-                "colmap/colmap:latest",
-                "colmap", "model_converter",
+                "-v", f"{host_work_str}:/work",
+                docker_image,
+                "model_converter",
                 "--input_path", f"/work/sparse/{model_dir.name}",
                 "--output_path", "/work/output/model",
                 "--output_type", "TXT"
@@ -228,10 +279,22 @@ class PhotogrammetryProcessor:
     def _create_mesh_from_colmap_model(self, output_dir: Path, metadata: Dict):
         """Create a simple mesh from COLMAP points"""
         try:
-            # Read points from COLMAP text format
+            # First try to read from PLY file if it exists
+            ply_file = output_dir / "points.ply"
+            if ply_file.exists():
+                logger.info(f"Reading points from PLY file: {ply_file}")
+                points = self._read_points_from_ply(ply_file)
+                if len(points) >= 4:
+                    self._create_convex_hull_obj(points, output_dir / "mesh.obj")
+                    return
+            
+            # Try to read points from COLMAP text format
             points_file = output_dir / "model" / "points3D.txt"
             if not points_file.exists():
-                raise FileNotFoundError("Points file not found")
+                # Try the direct output path
+                points_file = output_dir.parent / "sparse" / "0" / "points3D.txt"
+                if not points_file.exists():
+                    raise FileNotFoundError("Points file not found")
             
             points = []
             with open(points_file, 'r') as f:
@@ -255,34 +318,112 @@ class PhotogrammetryProcessor:
             logger.error(f"Failed to create mesh from COLMAP model: {e}")
             self._create_fallback_mesh(output_dir, metadata)
     
+    def _read_points_from_ply(self, ply_file: Path) -> np.ndarray:
+        """Read points from PLY file"""
+        points = []
+        with open(ply_file, 'rb') as f:
+            # Read header
+            header_end = False
+            vertex_count = 0
+            format_binary = False
+            properties = []
+            
+            while not header_end:
+                line = f.readline().decode('ascii').strip()
+                if line.startswith('format binary'):
+                    format_binary = True
+                elif line.startswith('element vertex'):
+                    vertex_count = int(line.split()[-1])
+                elif line.startswith('property'):
+                    properties.append(line.split()[2])  # property name
+                elif line == 'end_header':
+                    header_end = True
+            
+            logger.info(f"PLY file has {vertex_count} vertices with properties: {properties}")
+            
+            if format_binary:
+                # Binary format - COLMAP typically outputs x,y,z as floats and r,g,b as uchar
+                import struct
+                for i in range(vertex_count):
+                    # Read x, y, z as floats (12 bytes)
+                    xyz_data = f.read(12)
+                    if len(xyz_data) == 12:
+                        x, y, z = struct.unpack('<fff', xyz_data)
+                        points.append([x, y, z])
+                        # Skip RGB data (3 bytes for COLMAP output)
+                        f.read(3)
+            else:
+                # ASCII format
+                for i in range(vertex_count):
+                    line = f.readline().decode('ascii').strip()
+                    if line:
+                        values = line.split()
+                        if len(values) >= 3:
+                            x, y, z = float(values[0]), float(values[1]), float(values[2])
+                            points.append([x, y, z])
+        
+        return np.array(points) if points else np.array([]).reshape(0, 3)
+    
     def _create_convex_hull_obj(self, points: np.ndarray, output_path: Path):
         """Create a simple convex hull OBJ file from points"""
-        from scipy.spatial import ConvexHull
-        
-        # Compute convex hull
-        hull = ConvexHull(points)
-        
-        # Write OBJ file
-        with open(output_path, 'w') as f:
-            f.write("# OBJ file created by Circular 3D Scanner\n")
-            f.write(f"# {len(hull.vertices)} vertices, {len(hull.simplices)} faces\n\n")
+        try:
+            from scipy.spatial import ConvexHull
             
-            # Write vertices
-            for vertex_idx in hull.vertices:
-                v = points[vertex_idx]
-                f.write(f"v {v[0]} {v[1]} {v[2]}\n")
+            # Normalize points to reasonable scale
+            center = points.mean(axis=0)
+            points_centered = points - center
+            scale = np.abs(points_centered).max()
+            if scale > 0:
+                points_normalized = points_centered / scale * 2  # Scale to -2 to 2 range
+            else:
+                points_normalized = points_centered
             
-            f.write("\n")
+            # Compute convex hull
+            hull = ConvexHull(points_normalized)
             
-            # Write faces (triangles)
-            # Need to map from points indices to hull vertices indices
-            vertex_map = {original_idx: new_idx + 1 for new_idx, original_idx in enumerate(hull.vertices)}
+            # Write OBJ file
+            with open(output_path, 'w') as f:
+                f.write("# OBJ file created by Circular 3D Scanner\n")
+                f.write(f"# Generated from {len(points)} COLMAP points\n")
+                f.write(f"# {len(hull.vertices)} vertices, {len(hull.simplices)} faces\n\n")
+                
+                # Write vertices
+                for vertex_idx in hull.vertices:
+                    v = points_normalized[vertex_idx]
+                    f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+                
+                f.write("\n")
+                
+                # Write faces (triangles)
+                # Need to map from points indices to hull vertices indices
+                vertex_map = {original_idx: new_idx + 1 for new_idx, original_idx in enumerate(hull.vertices)}
+                
+                for simplex in hull.simplices:
+                    # OBJ faces are 1-indexed
+                    face_indices = [vertex_map.get(idx, 1) for idx in simplex if idx in vertex_map]
+                    if len(face_indices) == 3:
+                        f.write(f"f {face_indices[0]} {face_indices[1]} {face_indices[2]}\n")
+                        
+            logger.info(f"Created convex hull mesh with {len(hull.vertices)} vertices and {len(hull.simplices)} faces")
             
-            for simplex in hull.simplices:
-                # OBJ faces are 1-indexed
-                face_indices = [vertex_map.get(idx, 1) for idx in simplex if idx in vertex_map]
-                if len(face_indices) == 3:
-                    f.write(f"f {face_indices[0]} {face_indices[1]} {face_indices[2]}\n")
+        except ImportError:
+            logger.error("scipy not available, creating simple point cloud OBJ")
+            # Fallback: create point cloud OBJ
+            with open(output_path, 'w') as f:
+                f.write("# Point cloud OBJ file\n")
+                f.write(f"# {len(points)} points from COLMAP\n\n")
+                
+                # Normalize and write vertices
+                center = points.mean(axis=0)
+                points_centered = points - center
+                scale = np.abs(points_centered).max()
+                if scale > 0:
+                    points_normalized = points_centered / scale * 2
+                else:
+                    points_normalized = points_centered
+                    
+                for p in points_normalized:
+                    f.write(f"v {p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
     
     def _create_fallback_mesh(self, output_dir: Path, metadata: Dict):
         """Create a simple box mesh as fallback"""

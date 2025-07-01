@@ -4,6 +4,7 @@ import json
 import os
 import logging
 from photogrammetry import PhotogrammetryProcessor
+from datetime import datetime, timedelta
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -27,155 +28,126 @@ app.conf.update(
 # Initialize processor
 processor = PhotogrammetryProcessor()
 
-@app.task(bind=True)
-def process_photogrammetry(self, scan_id: str, zip_path: str, metadata: dict):
-    """Background task to process photogrammetry"""
+# Bind task to self for status updates
+class CallbackTask(app.Task):
+    def on_success(self, retval, task_id, args, kwargs):
+        """Success handler."""
+        logger.info(f"Task {task_id} succeeded with result: {retval}")
     
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        """Error handler."""
+        logger.error(f"Task {task_id} failed with exception: {exc}")
+
+@app.task(bind=True, base=CallbackTask)
+def process_photogrammetry(self, scan_id: str, zip_path: str, metadata: dict):
+    """
+    Process photogrammetry scan using COLMAP
+    """
     logger.info(f"Starting photogrammetry task for scan {scan_id}")
     
-    # Update task state
-    self.update_state(state='PROCESSING', meta={
-        'stage': 'initializing',
-        'progress': 0
-    })
-    
-    # Update scan status
-    update_scan_status(scan_id, "processing", {
-        "stage": "initializing",
-        "progress": 0
-    })
-    
     try:
-        # Update progress
-        self.update_state(state='PROCESSING', meta={
-            'stage': 'extracting_features',
-            'progress': 10
-        })
-        update_scan_status(scan_id, "processing", {
-            "stage": "extracting_features",
-            "progress": 10
-        })
+        # Update task state
+        self.update_state(state='PROGRESS', meta={'current': 'Initializing processor...'})
         
-        # Run photogrammetry
+        # Initialize processor
+        processor = PhotogrammetryProcessor()
+        
+        # Create a progress callback
+        def update_progress(message):
+            self.update_state(state='PROGRESS', meta={'current': message})
+        
+        # Process the scan with progress updates
+        self.update_state(state='PROGRESS', meta={'current': 'Extracting photos from ZIP...'})
+        
+        # Run photogrammetry processing
         result = processor.process_scan(
             scan_id=scan_id,
             zip_path=Path(zip_path),
             metadata=metadata
         )
         
-        if result["status"] == "success":
-            # Processing succeeded
-            self.update_state(state='SUCCESS', meta={
-                'stage': 'completed',
-                'progress': 100,
-                'models': result["models"],
-                'stats': result["stats"]
-            })
-            
-            update_scan_status(scan_id, "completed", {
-                "models": result["models"],
-                "stats": result["stats"],
-                "photo_count": result.get("photo_count", 0)
-            })
-            
-            logger.info(f"Photogrammetry completed for scan {scan_id}")
-            return {
-                'status': 'success',
-                'scan_id': scan_id,
-                'models': result["models"]
-            }
-        else:
-            # Processing failed
-            error_msg = result.get("error", "Unknown error")
-            self.update_state(state='FAILURE', meta={
-                'stage': 'failed',
-                'error': error_msg
-            })
-            
-            update_scan_status(scan_id, "failed", {
-                "error": error_msg
-            })
-            
-            logger.error(f"Photogrammetry failed for scan {scan_id}: {error_msg}")
-            return {
-                'status': 'failed',
-                'scan_id': scan_id,
-                'error': error_msg
-            }
-            
-    except Exception as e:
-        logger.error(f"Task exception for scan {scan_id}: {str(e)}")
+        # Update scan status
+        scan_dir = Path("uploads") / scan_id
+        status_file = scan_dir / "status.json"
         
-        self.update_state(state='FAILURE', meta={
-            'stage': 'error',
-            'error': str(e)
-        })
+        status_data = {
+            "status": "completed" if result["status"] == "success" else "failed",
+            "completed_at": datetime.now().isoformat(),
+            "result": result
+        }
         
-        update_scan_status(scan_id, "failed", {
-            "error": str(e)
-        })
+        with status_file.open("w") as f:
+            json.dump(status_data, f, indent=2)
+        
+        logger.info(f"Photogrammetry completed for scan {scan_id}")
         
         return {
-            'status': 'error',
-            'scan_id': scan_id,
-            'error': str(e)
+            "status": result["status"],
+            "scan_id": scan_id,
+            "models": result.get("models", {})
         }
-
-def update_scan_status(scan_id: str, status: str, data: dict):
-    """Update scan status in filesystem (should be database in production)"""
-    
-    # Update status file
-    status_file = Path(f"uploads/{scan_id}/status.json")
-    if status_file.parent.exists():
-        current_status = {}
-        if status_file.exists():
-            with open(status_file, 'r') as f:
-                current_status = json.load(f)
         
-        # Update status
-        from datetime import datetime
-        current_status.update({
-            "status": status,
-            "last_updated": datetime.now().isoformat(),
-            **data
-        })
+    except Exception as e:
+        logger.error(f"Photogrammetry failed for scan {scan_id}: {str(e)}")
         
-        # Write updated status
-        with open(status_file, 'w') as f:
-            json.dump(current_status, f, indent=2)
-    
-    # Also update the metadata file
-    metadata_file = Path(f"uploads/{scan_id}/metadata.json")
-    if metadata_file.exists():
-        with open(metadata_file, 'r') as f:
-            metadata = json.load(f)
+        # Update scan status
+        scan_dir = Path("uploads") / scan_id
+        status_file = scan_dir / "status.json"
         
-        metadata["status"] = status
-        metadata["processing_data"] = data
+        status_data = {
+            "status": "failed",
+            "completed_at": datetime.now().isoformat(),
+            "error": str(e)
+        }
         
-        with open(metadata_file, 'w') as f:
-            json.dump(metadata, f, indent=2)
+        with status_file.open("w") as f:
+            json.dump(status_data, f, indent=2)
+        
+        raise
 
 @app.task
-def cleanup_old_scans(days_old: int = 7):
-    """Clean up old scan files"""
-    import time
-    from datetime import datetime, timedelta
+def cleanup_old_scans():
+    """
+    Clean up old scan files (older than 7 days)
+    """
+    logger.info("Starting cleanup of old scans")
     
-    uploads_dir = Path("uploads")
-    if not uploads_dir.exists():
-        return
+    cutoff_date = datetime.now() - timedelta(days=7)
+    cleaned_count = 0
     
-    cutoff_time = time.time() - (days_old * 24 * 60 * 60)
-    cleaned = 0
+    for directory in [Path("uploads"), Path("processing")]:
+        if not directory.exists():
+            continue
+            
+        for scan_dir in directory.iterdir():
+            if not scan_dir.is_dir():
+                continue
+                
+            # Check metadata file for creation date
+            metadata_file = scan_dir / "metadata.json"
+            if metadata_file.exists():
+                try:
+                    with metadata_file.open("r") as f:
+                        metadata = json.load(f)
+                    
+                    created_at = datetime.fromisoformat(metadata.get("created_at", ""))
+                    if created_at < cutoff_date:
+                        # Delete the directory
+                        import shutil
+                        shutil.rmtree(scan_dir)
+                        cleaned_count += 1
+                        logger.info(f"Deleted old scan: {scan_dir.name}")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing {scan_dir}: {e}")
     
-    for scan_dir in uploads_dir.iterdir():
-        if scan_dir.is_dir():
-            # Check modification time
-            if scan_dir.stat().st_mtime < cutoff_time:
-                logger.info(f"Cleaning up old scan: {scan_dir.name}")
-                import shutil
-                shutil.rmtree(scan_dir)
-                cleaned += 1
-    
-    return f"Cleaned up {cleaned} old scans" 
+    logger.info(f"Cleanup completed. Deleted {cleaned_count} old scans")
+    return {"cleaned_count": cleaned_count}
+
+# Schedule periodic cleanup
+app.conf.beat_schedule = {
+    'cleanup-old-scans': {
+        'task': 'tasks.cleanup_old_scans',
+        'schedule': timedelta(hours=24),
+    },
+} 

@@ -290,10 +290,11 @@ function App() {
 
                         <ModelViewer
                             model={model3D}
-                            isProcessing={processStatus === 'processing'}
+                            isProcessing={isProcessing}
                             dimensions={dimensions}
                             photos={photos}
-                            scanId={scanResults?.uuid}
+                            scanId={scanResult?.uuid}
+                            taskId={scanResult?.task_id}
                         />
 
                         {processStatus === 'completed' && (
@@ -304,10 +305,11 @@ function App() {
                                     <h2 className="text-xl font-semibold mb-4">3D Model Preview</h2>
                                     <ModelViewer
                                         model={model3D}
-                                        isProcessing={processStatus === 'processing'}
+                                        isProcessing={isProcessing}
                                         dimensions={dimensions}
                                         photos={photos}
-                                        scanId={scanResults?.uuid}
+                                        scanId={scanResult?.uuid}
+                                        taskId={scanResult?.task_id}
                                     />
                                 </div>
 

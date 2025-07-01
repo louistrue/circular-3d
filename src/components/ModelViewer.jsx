@@ -10,7 +10,7 @@ function Loader() {
     return <Html center>{progress.toFixed(0)}% loaded</Html>
 }
 
-function OBJModel({ url }) {
+function OBJModel({ url, onLoaded }) {
     const [object, setObject] = useState(null)
     const meshRef = useRef()
 
@@ -31,6 +31,7 @@ function OBJModel({ url }) {
                 obj.scale.multiplyScalar(scale)
 
                 setObject(obj)
+                if (onLoaded) onLoaded(obj)
             },
             (xhr) => {
                 console.log((xhr.loaded / xhr.total * 100) + '% loaded')
@@ -39,7 +40,7 @@ function OBJModel({ url }) {
                 console.error('Error loading OBJ:', error)
             }
         )
-    }, [url])
+    }, [url, onLoaded])
 
     useFrame(() => {
         if (meshRef.current) {
@@ -66,8 +67,6 @@ function Simple3DModel({ model }) {
     }
 
     const { dimensions, subdivisions } = model
-
-    console.log('Rendering simple 3D model:', { dimensions, subdivisions })
 
     return (
         <group>
@@ -118,14 +117,58 @@ function Simple3DModel({ model }) {
     )
 }
 
-function ModelViewer({ model, isProcessing, dimensions, photos, scanId }) {
+function ModelViewer({ model, isProcessing, dimensions, photos, scanId, taskId }) {
     const [contextLost, setContextLost] = useState(false)
     const [retryCount, setRetryCount] = useState(0)
     const [realModelUrl, setRealModelUrl] = useState(null)
-    const [modelStatus, setModelStatus] = useState('loading')
+    const [modelStatus, setModelStatus] = useState('preview')
+    const [processingStatus, setProcessingStatus] = useState('')
+    const [taskProgress, setTaskProgress] = useState(null)
 
     const hasValidDimensions = dimensions.length && dimensions.width && dimensions.height
     const hasPhotos = photos && photos.length > 0
+
+    // Poll task status for real-time updates
+    useEffect(() => {
+        if (taskId && isProcessing) {
+            const checkTaskStatus = async () => {
+                try {
+                    const response = await fetch(`http://localhost:8000/task/${taskId}`)
+                    const data = await response.json()
+                    
+                    if (data.status === 'SUCCESS') {
+                        setProcessingStatus('Model ready!')
+                        setModelStatus('loading')
+                    } else if (data.status === 'FAILURE') {
+                        setProcessingStatus('Processing failed')
+                        setModelStatus('error')
+                    } else if (data.status === 'PENDING') {
+                        setProcessingStatus('Starting processing...')
+                    } else if (data.info) {
+                        // Extract status from task info
+                        if (typeof data.info === 'string') {
+                            setProcessingStatus(data.info)
+                        } else if (data.info.current) {
+                            setProcessingStatus(data.info.current)
+                            if (data.info.total) {
+                                setTaskProgress({
+                                    current: data.info.current,
+                                    total: data.info.total,
+                                    percent: (data.info.current / data.info.total) * 100
+                                })
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error checking task status:', error)
+                }
+            }
+
+            checkTaskStatus()
+            const interval = setInterval(checkTaskStatus, 2000)
+            return () => clearInterval(interval)
+        }
+    }, [taskId, isProcessing])
 
     // Check for real model from backend
     useEffect(() => {
@@ -134,24 +177,30 @@ function ModelViewer({ model, isProcessing, dimensions, photos, scanId }) {
                 try {
                     const response = await fetch(`http://localhost:8000/model/${scanId}?format=obj`)
                     if (response.ok) {
-                        setRealModelUrl(`http://localhost:8000/model/${scanId}?format=obj`)
+                        const url = `http://localhost:8000/model/${scanId}?format=obj&t=${Date.now()}`
+                        setRealModelUrl(url)
                         setModelStatus('ready')
-                    } else {
+                        setProcessingStatus('Loading real model...')
+                    } else if (modelStatus !== 'preview') {
                         setModelStatus('processing')
                     }
                 } catch (error) {
                     console.error('Error checking for model:', error)
-                    setModelStatus('error')
+                    if (modelStatus !== 'preview') {
+                        setModelStatus('error')
+                    }
                 }
             }
 
             checkForModel()
 
             // Poll for model if still processing
-            const interval = setInterval(checkForModel, 5000)
-            return () => clearInterval(interval)
+            if (modelStatus === 'processing' || modelStatus === 'loading') {
+                const interval = setInterval(checkForModel, 3000)
+                return () => clearInterval(interval)
+            }
         }
-    }, [scanId, isProcessing])
+    }, [scanId, isProcessing, modelStatus])
 
     // Auto-retry on context loss
     useEffect(() => {
@@ -179,19 +228,6 @@ function ModelViewer({ model, isProcessing, dimensions, photos, scanId }) {
                     >
                         Refresh Page
                     </button>
-                </div>
-            </div>
-        )
-    }
-
-    if (isProcessing) {
-        return (
-            <div className="w-full h-96 bg-gradient-to-r from-blue-50 to-purple-50 rounded-lg flex items-center justify-center">
-                <div className="text-center">
-                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
-                    <div className="text-gray-600">Processing with COLMAP...</div>
-                    <div className="text-sm text-gray-500 mt-2">Creating real 3D model from {photos?.length || 0} photos</div>
-                    <div className="text-xs text-gray-400 mt-1">This may take a few minutes</div>
                 </div>
             </div>
         )
@@ -238,7 +274,10 @@ function ModelViewer({ model, isProcessing, dimensions, photos, scanId }) {
 
                     {/* 3D Model - Real or Placeholder */}
                     {realModelUrl && modelStatus === 'ready' ? (
-                        <OBJModel url={realModelUrl} />
+                        <OBJModel 
+                            url={realModelUrl} 
+                            onLoaded={() => setProcessingStatus('Real model loaded!')}
+                        />
                     ) : (
                         model && <Simple3DModel model={model} />
                     )}
@@ -262,16 +301,38 @@ function ModelViewer({ model, isProcessing, dimensions, photos, scanId }) {
                 {modelStatus === 'ready' && (
                     <div className="text-green-400 mt-1">✅ Real 3D model loaded</div>
                 )}
+                {modelStatus === 'preview' && (
+                    <div className="text-yellow-400 mt-1">📦 Preview model (box)</div>
+                )}
             </div>
 
+            {/* Processing status overlay */}
+            {isProcessing && (
+                <div className="absolute top-4 right-4 bg-black bg-opacity-70 text-white p-3 rounded-lg text-sm max-w-xs">
+                    <div className="font-semibold mb-2">🔄 COLMAP Processing</div>
+                    <div className="text-gray-300">{processingStatus || 'Starting...'}</div>
+                    {taskProgress && (
+                        <div className="mt-2">
+                            <div className="bg-gray-700 rounded-full h-2 overflow-hidden">
+                                <div 
+                                    className="bg-blue-500 h-full transition-all duration-300"
+                                    style={{ width: `${taskProgress.percent}%` }}
+                                />
+                            </div>
+                            <div className="text-xs mt-1">{taskProgress.percent.toFixed(0)}%</div>
+                        </div>
+                    )}
+                </div>
+            )}
+
             {/* Model stats */}
-            {model && (
+            {(model || realModelUrl) && (
                 <div className="absolute bottom-4 right-4 bg-black bg-opacity-50 text-white p-3 rounded-lg text-sm">
                     <div className="font-semibold mb-1">3D Model Stats</div>
                     <div>Photos: {photos?.length || 0}</div>
-                    <div>Quality: {model.quality}</div>
+                    <div>Quality: {model?.quality || 'processing'}</div>
                     <div>Status: {modelStatus}</div>
-                    {scanId && (
+                    {scanId && modelStatus === 'ready' && (
                         <div className="mt-2">
                             <a
                                 href={`http://localhost:8000/model/${scanId}?format=obj`}

@@ -6,12 +6,16 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      - ./backend:/app
       - ./backend/uploads:/app/uploads
       - ./backend/processing:/app/processing
-      - /var/run/docker.sock:/var/run/docker.sock  # Allow Docker-in-Docker
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - REDIS_URL=redis://redis:6379
-      - PYTHONUNBUFFERED=1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      # Mount paths for Docker-in-Docker
+      - HOST_UPLOAD_PATH=${PWD}/backend/uploads
+      - HOST_PROCESSING_PATH=${PWD}/backend/processing
     depends_on:
       - redis
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
@@ -26,22 +30,21 @@ services:
   worker:
     build: ./backend
     volumes:
+      - ./backend:/app
       - ./backend/uploads:/app/uploads
       - ./backend/processing:/app/processing
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - REDIS_URL=redis://redis:6379
-      - PYTHONUNBUFFERED=1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      # Use our custom COLMAP image with MKL support
+      - COLMAP_IMAGE=colmap-cpu:latest
+      # Mount paths for Docker-in-Docker
+      - HOST_UPLOAD_PATH=${PWD}/backend/uploads
+      - HOST_PROCESSING_PATH=${PWD}/backend/processing
     depends_on:
       - redis
     command: celery -A tasks worker --loglevel=info
-
-  # Pull COLMAP image but don't run it - it will be used by the worker
-  colmap:
-    image: colmap/colmap:latest
-    command: echo "COLMAP image ready"
-    profiles:
-      - setup
 
 volumes:
   redis_data: 
